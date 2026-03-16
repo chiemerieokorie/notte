@@ -45,11 +45,11 @@ RUNNING_IN_PYODIDE = "pyodide" in sys.modules
 
 if RUNNING_IN_PYODIDE:
     import js  # pyright: ignore[reportMissingImports]
-    from pyodide.ffi import (  # pyright: ignore [reportMissingImports]
-        create_proxy,  # pyright: ignore [reportUnknownVariableType]
+    from pyodide.ffi import (  # pyright: ignore[reportMissingImports]
+        create_proxy,  # pyright: ignore[reportUnknownVariableType]
     )
 else:
-    from websockets.asyncio import client
+    from websockets.sync import client as sync_client
 
 
 if TYPE_CHECKING:
@@ -277,7 +277,73 @@ class AgentsClient(BaseClient):
 
         raise TimeoutError("Agent did not complete in time")
 
-    async def watch_logs(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse | None:
+    def _process_ws_message(
+        self,
+        message: str,
+        agent_id: str,
+        log: bool,
+        counter: list[int],
+    ) -> tuple[AgentCompletion | AgentStatusResponse | None, bool]:
+        """
+        Process a websocket message. Returns (response, should_stop).
+
+        Args:
+            message: The raw websocket message string.
+            agent_id: The agent identifier for logging.
+            log: Whether to log the agent steps.
+            counter: A mutable list containing [step_count] to track step number.
+
+        Returns:
+            Tuple of (response, should_stop) where response is the parsed message
+            and should_stop indicates if the agent has completed.
+        """
+        try:
+            dic = json.loads(message)
+            response = None
+
+            # output from validator
+            if isinstance(dic, dict) and "validation" in dic:
+                logger.opt(colors=True).info("<g>{message}</g>", message=dic["validation"])
+
+            # termination message
+            elif isinstance(dic, dict) and "status" in dic:
+                if dic["status"] == "agent_stop":
+                    # Parse the agent status response from the message
+                    if "agent" in dic:
+                        agent_status = AgentStatusResponse.model_validate(dic["agent"])
+                        return (agent_status, True)
+                    # Fallback: no agent field, this shouldn't happen but handle gracefully
+                    return (None, True)
+
+            # actual step
+            else:
+                if isinstance(dic, dict):
+                    response = AgentCompletion.model_validate(dic)
+                else:
+                    # Unexpected: log and skip
+                    logger.warning(f"Expected dict, got {type(dic).__name__}: {message[:200]}")
+                    return (None, False)
+                if log:
+                    logger.opt(colors=True).info(
+                        "✨ <r>Step {counter}</r> <y>(agent: {agent_id})</y>",
+                        counter=(counter[0] + 1),
+                        agent_id=agent_id,
+                    )
+                    response.live_log_state()
+                counter[0] += 1
+
+            return (response, False)
+
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
+            if "error" in message and "last action failed with error" not in message:
+                logger.error(f"Error in agent logs: {e} {agent_id} {message}")
+            elif agent_id in message and "agent_id" in message:
+                logger.error(f"Error parsing AgentStatusResponse for message: {message}: {e}")
+            else:
+                logger.error(f"Error parsing agent logs for message: {message}: {e}")
+            return (None, False)
+
+    def watch_logs(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse | None:
         """
         Watch the logs of the specified agent.
         """
@@ -285,154 +351,46 @@ class AgentsClient(BaseClient):
         wss_url = self.request_path(endpoint).format(agent_id=agent_id, token=self.token, session_id=session_id)
         wss_url = wss_url.replace("https://", "wss://").replace("http://", "ws://")
 
-        async def get_messages() -> AgentStatusResponse | None:
-            counter = 0
+        counter = [0]  # mutable container for step count
 
-            def process_message(message: str) -> tuple[AgentCompletion | AgentStatusResponse | None, bool]:
-                """Process a websocket message. Returns (response, should_stop)."""
-                nonlocal counter
-                try:
-                    # try to json load
-                    dic = json.loads(message)
-                    response = None
+        if RUNNING_IN_PYODIDE:
+            raise NotImplementedError(
+                "Synchronous watch_logs is not supported in Pyodide. Use async_watch_logs() or async_watch_logs_and_wait() instead."
+            )
 
-                    # output from validator
-                    if isinstance(dic, dict) and "validation" in dic:
-                        logger.opt(colors=True).info("<g>{message}</g>", message=dic["validation"])
+        # Use native Python sync websockets library
+        try:
+            with sync_client.connect(  # pyright: ignore[reportPossiblyUnboundVariable]
+                uri=wss_url,
+                open_timeout=30,
+                ping_interval=5,
+                ping_timeout=40,
+                close_timeout=5,
+                max_size=5 * (2**20),  # 5MB max size
+            ) as websocket:
+                for message in websocket:
+                    if not isinstance(message, str):
+                        logger.warning(f"Expected str message, got {type(message).__name__}. Skipping.")
+                        continue
+                    response, should_stop = self._process_ws_message(message, agent_id, log, counter)
 
-                    # termination message
-                    elif isinstance(dic, dict) and "status" in dic:
-                        if dic["status"] == "agent_stop":
-                            # Parse the agent status response from the message
-                            if "agent" in dic:
-                                agent_status = AgentStatusResponse.model_validate(dic["agent"])
-                                return (agent_status, True)
-                            # Fallback: no agent field, this shouldn't happen but handle gracefully
-                            return (None, True)
-
-                    # actual step
-                    else:
-                        if isinstance(dic, dict):
-                            response = AgentCompletion.model_validate(dic)
-                        else:
-                            # Unexpected: log and skip
-                            logger.warning(f"Expected dict, got {type(dic).__name__}: {message[:200]}")
-                            return (None, False)
-                        if log:
-                            logger.opt(colors=True).info(
-                                "✨ <r>Step {counter}</r> <y>(agent: {agent_id})</y>",
-                                counter=(counter + 1),
-                                agent_id=agent_id,
-                            )
-                            response.live_log_state()
-                        counter += 1
-
-                    return (response, False)
-
-                except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
-                    if "error" in message and "last action failed with error" not in message:
-                        logger.error(f"Error in agent logs: {e} {agent_id} {message}")
-                    elif agent_id in message and "agent_id" in message:
-                        logger.error(f"Error parsing AgentStatusResponse for message: {message}: {e}")
-                    else:
-                        logger.error(f"Error parsing agent logs for message: {message}: {e}")
-                    return (None, False)
-
-            if RUNNING_IN_PYODIDE:
-                # Use JavaScript WebSocket API via Pyodide FFI
-                ws = js.WebSocket.new(wss_url)  # pyright: ignore [reportPossiblyUnboundVariable, reportUnknownMemberType, reportUnknownVariableType]
-                message_queue: asyncio.Queue[str | None] = asyncio.Queue()
-
-                # Create proxies for event handlers
-                def on_message(event: Any) -> None:
-                    message_queue.put_nowait(str(event.data))
-
-                def on_error(_event: Any) -> None:
-                    logger.error("WebSocket error occurred")
-
-                def on_close(_event: Any) -> None:
-                    message_queue.put_nowait(None)  # Signal end
-
-                on_message_proxy = create_proxy(on_message)  # pyright: ignore [reportPossiblyUnboundVariable, reportUnknownVariableType]
-                on_error_proxy = create_proxy(on_error)  # pyright: ignore [reportUnknownVariableType, reportPossiblyUnboundVariable]
-                on_close_proxy = create_proxy(on_close)  # pyright: ignore [reportUnknownVariableType, reportPossiblyUnboundVariable]
-
-                ws.addEventListener("message", on_message_proxy)  # pyright: ignore[reportUnknownMemberType]
-                ws.addEventListener("error", on_error_proxy)  # pyright: ignore[reportUnknownMemberType]
-                ws.addEventListener("close", on_close_proxy)  # pyright: ignore[reportUnknownMemberType]
-
-                # Wait for connection
-                while ws.readyState == 0:  # CONNECTING  # pyright: ignore [reportUnknownMemberType]
-                    await asyncio.sleep(0.1)
-
-                try:
-                    while True:
-                        message = await message_queue.get()
-                        if message is None:  # Connection closed
-                            break
-
-                        assert isinstance(message, str), f"Expected str, got {type(message)}"
-                        response, should_stop = process_message(message)
-
-                        if should_stop:
-                            # If we got an AgentStatusResponse, return it; otherwise return None (failure)
-                            if isinstance(response, AgentStatusResponse):
-                                return response
-                            return None
-
-                except ConnectionError as e:
-                    logger.error(f"Connection error: {agent_id} {e}")
-                    return None
-                except Exception as e:
-                    logger.error(f"Error: {agent_id} {e} {traceback.format_exc()}")
-                    return None
-                finally:
-                    try:
-                        ws.removeEventListener("message", on_message_proxy)  # pyright: ignore[reportUnknownMemberType]
-                        ws.removeEventListener("error", on_error_proxy)  # pyright: ignore[reportUnknownMemberType]
-                        ws.removeEventListener("close", on_close_proxy)  # pyright: ignore[reportUnknownMemberType]
-                    except Exception:
-                        pass
-                    on_message_proxy.destroy()  # pyright: ignore [reportUnknownMemberType]
-                    on_error_proxy.destroy()  # pyright: ignore [reportUnknownMemberType]
-                    on_close_proxy.destroy()  # pyright: ignore [reportUnknownMemberType]
-                    ws.close()  # pyright: ignore[reportUnknownMemberType]
-
-            else:
-                # Use native Python websockets library
-                async with client.connect(  # pyright: ignore[reportPossiblyUnboundVariable]
-                    uri=wss_url,
-                    open_timeout=30,
-                    ping_interval=5,
-                    ping_timeout=40,
-                    close_timeout=5,
-                    max_size=5 * (2**20),  # 5MB max size
-                ) as websocket:
-                    try:
-                        async for message in websocket:
-                            assert isinstance(message, str), f"Expected str, got {type(message)}"
-                            response, should_stop = process_message(message)
-
-                            if should_stop:
-                                # If we got an AgentStatusResponse, return it; otherwise return None (failure)
-                                if isinstance(response, AgentStatusResponse):
-                                    return response
-                                return None
-
-                    except ConnectionError as e:
-                        logger.error(f"Connection error: {agent_id} {e}")
+                    if should_stop:
+                        # If we got an AgentStatusResponse, return it; otherwise return None (failure)
+                        if isinstance(response, AgentStatusResponse):
+                            return response
                         return None
-                    except Exception as e:
-                        logger.error(f"Error: {agent_id} {e} {traceback.format_exc()}")
-                        return None
+        except ConnectionError as e:
+            logger.error(f"Connection error: {agent_id} {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected websocket processing error: {agent_id} {e} {traceback.format_exc()}")
+            raise
 
-        return await get_messages()
+        return None
 
-    async def watch_logs_and_wait(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse:
+    def watch_logs_and_wait(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse:
         """
         Execute a task with the agent and wait for completion.
-
-        This is an async method that watches logs and waits for the agent to complete.
 
         Args:
             agent_id (str): The agent identifier.
@@ -442,22 +400,183 @@ class AgentsClient(BaseClient):
         Returns:
             AgentStatusResponse: The response from the completed agent execution.
         """
-        status = None
+        # In Pyodide, sync WebSocket connections aren't supported and there's always a running event loop
+        if RUNNING_IN_PYODIDE:
+            raise RuntimeError(
+                "watch_logs_and_wait() cannot be used in Pyodide. Use `await async_watch_logs_and_wait(...)` instead."
+            )
+
         try:
-            response = await self.watch_logs(agent_id=agent_id, session_id=session_id, log=log)
+            response = self.watch_logs(agent_id=agent_id, session_id=session_id, log=log)
             if response is not None:
                 return response
-            # If we didn't get a response, it means something failed
-            # Try to get the status once as a fallback
-            logger.warning(f"[Agent] {agent_id} did not return status response. Fetching status as fallback.")
-            return self.status(agent_id=agent_id)
-
-        except asyncio.CancelledError:
-            if status is None:
+            # If we didn't get a response, poll status until agent is closed
+            logger.warning(f"[Agent] {agent_id} did not return status response. Polling status until closed.")
+            max_wait_secs = 300
+            waited = 0
+            while waited < max_wait_secs:
                 status = self.status(agent_id=agent_id)
+                if status.status == AgentStatus.closed:
+                    return status
+                time.sleep(1)
+                waited += 1
+            raise TimeoutError(f"Agent {agent_id} did not reach a terminal state within {max_wait_secs}s")
 
+        except KeyboardInterrupt:
+            status = self.status(agent_id=agent_id)
             if status.status != AgentStatus.closed:
                 _ = self.stop(agent_id=agent_id, session_id=session_id)
+            raise
+
+    async def async_watch_logs(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse | None:
+        """
+        Watch the logs of the specified agent asynchronously.
+
+        This method is required for Pyodide environments where synchronous WebSocket
+        connections are not supported.
+
+        Args:
+            agent_id (str): The agent identifier.
+            session_id (str): The session identifier.
+            log (bool): Whether to log the agent steps.
+
+        Returns:
+            AgentStatusResponse | None: The final agent status, or None if failed.
+        """
+        if not RUNNING_IN_PYODIDE:
+            raise NotImplementedError("async_watch_logs is only supported in Pyodide. Use watch_logs instead.")
+
+        endpoint = NotteEndpoint(path=AgentsClient.AGENT_LOGS_WS, response=BaseModel, method="GET")
+        wss_url = self.request_path(endpoint).format(agent_id=agent_id, token=self.token, session_id=session_id)
+        wss_url = wss_url.replace("https://", "wss://").replace("http://", "ws://")
+
+        counter = [0]  # mutable container for step count
+
+        # Use JavaScript WebSocket API via Pyodide FFI
+        ws = js.WebSocket.new(wss_url)  # pyright: ignore[reportPossiblyUnboundVariable, reportUnknownMemberType, reportUnknownVariableType]
+        message_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def on_message(event: Any) -> None:
+            message_queue.put_nowait(str(event.data))
+
+        def on_error(_event: Any) -> None:
+            logger.error("WebSocket error occurred")
+            message_queue.put_nowait(None)  # Signal consumer to stop on error
+
+        def on_close(_event: Any) -> None:
+            message_queue.put_nowait(None)
+
+        # Initialize proxies to None for cleanup handling
+        on_message_proxy: Any = None
+        on_error_proxy: Any = None
+        on_close_proxy: Any = None
+
+        # Helper to clean up WebSocket resources (tolerates partially initialized state)
+        def cleanup_ws() -> None:
+            cleanup_errors: list[str] = []
+            for cleanup in (  # pyright: ignore[reportUnknownVariableType]
+                lambda: ws.removeEventListener("message", on_message_proxy),  # pyright: ignore[reportUnknownMemberType, reportUnknownLambdaType]
+                lambda: ws.removeEventListener("error", on_error_proxy),  # pyright: ignore[reportUnknownMemberType, reportUnknownLambdaType]
+                lambda: ws.removeEventListener("close", on_close_proxy),  # pyright: ignore[reportUnknownMemberType, reportUnknownLambdaType]
+                lambda: on_message_proxy.destroy() if on_message_proxy is not None else None,
+                lambda: on_error_proxy.destroy() if on_error_proxy is not None else None,
+                lambda: on_close_proxy.destroy() if on_close_proxy is not None else None,
+                ws.close,  # pyright: ignore[reportUnknownMemberType]
+            ):
+                try:
+                    _ = cleanup()  # pyright: ignore[reportUnknownVariableType]
+                except Exception as e:
+                    cleanup_errors.append(str(e))
+            if cleanup_errors:
+                logger.debug(f"Failed to clean up WebSocket resources: {'; '.join(cleanup_errors)}")
+
+        # Wait for connection with timeout
+        connect_timeout = 30.0
+        connect_waited = 0.0
+
+        try:
+            # Create proxies and register event listeners inside try block for proper cleanup
+            on_message_proxy = create_proxy(on_message)  # pyright: ignore[reportPossiblyUnboundVariable]
+            on_error_proxy = create_proxy(on_error)  # pyright: ignore[reportPossiblyUnboundVariable]
+            on_close_proxy = create_proxy(on_close)  # pyright: ignore[reportPossiblyUnboundVariable]
+
+            ws.addEventListener("message", on_message_proxy)  # pyright: ignore[reportUnknownMemberType]
+            ws.addEventListener("error", on_error_proxy)  # pyright: ignore[reportUnknownMemberType]
+            ws.addEventListener("close", on_close_proxy)  # pyright: ignore[reportUnknownMemberType]
+
+            while ws.readyState == 0:  # CONNECTING  # pyright: ignore[reportUnknownMemberType]
+                if connect_waited >= connect_timeout:
+                    logger.error(f"[Agent] {agent_id} websocket connection timed out after {connect_timeout}s")
+                    return None
+                await asyncio.sleep(0.1)
+                connect_waited += 0.1
+            while True:
+                message = await message_queue.get()
+                if message is None:
+                    break
+
+                response, should_stop = self._process_ws_message(message, agent_id, log, counter)
+
+                if should_stop:
+                    if isinstance(response, AgentStatusResponse):
+                        return response
+                    return None
+
+        except ConnectionError as e:
+            logger.error(f"Connection error: {agent_id} {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected websocket processing error: {agent_id} {e} {traceback.format_exc()}")
+            raise
+        finally:
+            cleanup_ws()
+
+        return None
+
+    async def async_watch_logs_and_wait(self, agent_id: str, session_id: str, log: bool = True) -> AgentStatusResponse:
+        """
+        Execute a task with the agent and wait for completion asynchronously.
+
+        This method is required for Pyodide environments where synchronous WebSocket
+        connections are not supported.
+
+        Args:
+            agent_id (str): The agent identifier.
+            session_id (str): The session identifier.
+            log (bool): Whether to log the agent steps.
+
+        Returns:
+            AgentStatusResponse: The response from the completed agent execution.
+        """
+        if not RUNNING_IN_PYODIDE:
+            raise NotImplementedError(
+                "async_watch_logs_and_wait is only supported in Pyodide. Use watch_logs_and_wait instead."
+            )
+
+        try:
+            response = await self.async_watch_logs(agent_id=agent_id, session_id=session_id, log=log)
+            if response is not None:
+                return response
+            # If we didn't get a response, poll status until agent is closed
+            logger.warning(f"[Agent] {agent_id} did not return status response. Polling status until closed.")
+            max_wait_secs = 300
+            waited = 0
+            while waited < max_wait_secs:
+                status = self.status(agent_id=agent_id)
+                if status.status == AgentStatus.closed:
+                    return status
+                await asyncio.sleep(1)
+                waited += 1
+            raise TimeoutError(f"Agent {agent_id} did not reach a terminal state within {max_wait_secs}s")
+
+        except asyncio.CancelledError:
+            # Best-effort cleanup: don't let HTTP failures mask the CancelledError
+            try:
+                status = self.status(agent_id=agent_id)
+                if status.status != AgentStatus.closed:
+                    _ = self.stop(agent_id=agent_id, session_id=session_id)
+            except Exception:
+                pass
             raise
 
     def stop(self, agent_id: str, session_id: str) -> AgentResponse:
@@ -498,20 +617,18 @@ class AgentsClient(BaseClient):
 
         > Websockets are used to stream the agent logs to the standard output to provide live logs to the user.
         """
-        return asyncio.run(self.arun(**data))
-
-    async def arun(self, **data: Unpack[SdkAgentStartRequestDict]) -> AgentStatusResponse:
-        """
-        Run an async agent with the specified request parameters.
-        and wait for completion
-
-        Validates the provided data using the AgentCreateRequest model, sends a run request through the
-        designated endpoint, updates the last agent response, and returns the resulting AgentResponse.
-        """
         response = self.start(**data)
-        # wait for completion
 
-        return await self.watch_logs_and_wait(
+        if RUNNING_IN_PYODIDE:
+            # In Pyodide, use the async path - asyncio.run works with Pyodide's WebLoop
+            return asyncio.run(
+                self.async_watch_logs_and_wait(
+                    agent_id=response.agent_id,
+                    session_id=response.session_id,
+                )
+            )
+
+        return self.watch_logs_and_wait(
             agent_id=response.agent_id,
             session_id=response.session_id,
         )
@@ -627,32 +744,35 @@ class AgentsClient(BaseClient):
         file_bytes = self._request_file(endpoint, file_type="mp4")
         return MP4Replay(file_bytes)
 
-    async def arun_custom(self, request: BaseModel, viewer: bool = False) -> AgentStatusResponse:
-        if not self.is_custom_endpoint_available():
-            raise ValueError(f"Custom endpoint is not available for this server: {self.server_url}")
-
-        async def agent_task() -> AgentStatusResponse:
-            response = self.request(AgentsClient._agent_start_custom_endpoint().with_request(request))
-
-            if viewer:
-                self.root_client.sessions.viewer(response.session_id)
-
-            return await self.watch_logs_and_wait(
-                agent_id=response.agent_id,
-                session_id=response.session_id,
-                log=True,
-            )
-
-        return await agent_task()
-
     def run_custom(self, request: BaseModel, viewer: bool = False) -> AgentStatusResponse:
         """
-        Run an custom agent with the specified request parameters.
-        and wait for completion
+        Run a custom agent with the specified request parameters and wait for completion.
 
         Note: not all servers support custom agents.
         """
-        return asyncio.run(self.arun_custom(request, viewer=viewer))
+        if not self.is_custom_endpoint_available():
+            raise ValueError(f"Custom endpoint is not available for this server: {self.server_url}")
+
+        response = self.request(AgentsClient._agent_start_custom_endpoint().with_request(request))
+
+        if viewer:
+            self.root_client.sessions.viewer(response.session_id)
+
+        if RUNNING_IN_PYODIDE:
+            # In Pyodide, use the async path - asyncio.run works with Pyodide's WebLoop
+            return asyncio.run(
+                self.async_watch_logs_and_wait(
+                    agent_id=response.agent_id,
+                    session_id=response.session_id,
+                    log=True,
+                )
+            )
+
+        return self.watch_logs_and_wait(
+            agent_id=response.agent_id,
+            session_id=response.session_id,
+            log=True,
+        )
 
 
 class RemoteAgent:
@@ -894,23 +1014,66 @@ class RemoteAgent:
 
         return self.client.wait(agent_id=self.agent_id)
 
-    async def watch_logs(self, log: bool = False) -> AgentStatusResponse | None:
+    def watch_logs(self, log: bool = False) -> AgentStatusResponse | None:
         """
         Watch the logs of the agent.
         """
         if self.existing_agent:
             raise ValueError("You cannot call watch_logs() on an agent instantiated from agent id")
 
-        return await self.client.watch_logs(agent_id=self.agent_id, session_id=self.session_id, log=log)
+        return self.client.watch_logs(agent_id=self.agent_id, session_id=self.session_id, log=log)
 
-    async def watch_logs_and_wait(self, log: bool = True) -> AgentStatusResponse:
+    def watch_logs_and_wait(self, log: bool = True) -> AgentStatusResponse:
         """
         Watch the logs of the agent and wait for completion.
         """
         if self.existing_agent:
             raise ValueError("You cannot call watch_logs_and_wait() on an agent instantiated from agent id")
 
-        return await self.client.watch_logs_and_wait(agent_id=self.agent_id, session_id=self.session_id, log=log)
+        return self.client.watch_logs_and_wait(agent_id=self.agent_id, session_id=self.session_id, log=log)
+
+    async def async_watch_logs_and_wait(self, log: bool = True) -> AgentStatusResponse:
+        """
+        Watch the logs of the agent and wait for completion asynchronously.
+
+        In Pyodide (WebAssembly), this delegates to the client's async method directly
+        since asyncio.to_thread is not supported in single-threaded environments.
+        In native Python, this runs the synchronous watch_logs_and_wait in a thread pool
+        to avoid blocking the event loop.
+
+        Note: When cancelled (e.g., via asyncio.timeout), this method stops the agent
+        gracefully. However, in native Python the underlying thread cannot be interrupted
+        immediately - it will continue until the server processes the stop signal and
+        closes the WebSocket connection. This is not a leak, but cancellation may not
+        be instantaneous under high load.
+        """
+        if self.existing_agent:
+            raise ValueError("You cannot call async_watch_logs_and_wait() on an agent instantiated from agent id")
+
+        if RUNNING_IN_PYODIDE:
+            return await self.client.async_watch_logs_and_wait(
+                agent_id=self.agent_id,
+                session_id=self.session_id,
+                log=log,
+            )
+
+        try:
+            return await asyncio.to_thread(
+                self.client.watch_logs_and_wait,
+                agent_id=self.agent_id,
+                session_id=self.session_id,
+                log=log,
+            )
+        except asyncio.CancelledError:
+            # Gracefully stop the agent on cancellation (mirrors KeyboardInterrupt handling in sync version)
+            # Best-effort cleanup: don't let HTTP failures mask the CancelledError
+            try:
+                status = self.client.status(agent_id=self.agent_id)
+                if status.status != AgentStatus.closed:
+                    _ = self.client.stop(agent_id=self.agent_id, session_id=self.session_id)
+            except Exception:
+                pass
+            raise
 
     @track_usage("cloud.agent.stop")
     def stop(self) -> AgentResponse:
@@ -958,28 +1121,14 @@ class RemoteAgent:
         if self.existing_agent:
             raise ValueError("You cannot call run() on an agent instantiated from agent id")
 
-        return asyncio.run(self.arun(**data))
-
-    @track_usage("cloud.agent.arun")
-    async def arun(self, **data: Unpack[AgentRunRequestDict]) -> AgentStatusResponse:
-        """
-        Asynchronously execute a task with the agent.
-
-        This is currently a wrapper around the synchronous run method.
-        In future versions, this might be implemented as a true async operation.
-
-        Args:
-            **data: Keyword arguments representing the fields of an AgentRunRequest.
-
-        Returns:
-            AgentStatusResponse: The final status response after task completion.
-        """
-        if self.existing_agent:
-            raise ValueError("You cannot call arun() on an agent instantiated from agent id")
-
         self.response = self.start(**data)
         logger.info(f"[Agent] {self.agent_id} started with model: {self.request.reasoning_model}")
-        status_response = await self.watch_logs_and_wait()
+
+        if RUNNING_IN_PYODIDE:
+            # In Pyodide, use the async path - asyncio.run works with Pyodide's WebLoop
+            status_response = asyncio.run(self.async_watch_logs_and_wait())
+        else:
+            status_response = self.watch_logs_and_wait()
         prefix = "✅ Agent returned with success:" if status_response.success else "❌ Agent returned with failure:"
         logger.info(f"{prefix} {status_response.answer}")
         return status_response
