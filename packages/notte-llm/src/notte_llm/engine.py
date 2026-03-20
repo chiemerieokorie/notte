@@ -92,11 +92,41 @@ def fix_schema_for_gemini(schema: dict[str, Any]) -> dict[str, Any]:
     def clean_schema(obj: Any, parent_key: str | None = None) -> Any:
         if isinstance(obj, dict):
             obj_dict = cast(dict[str, Any], obj)
-            cleaned: dict[str, Any] = {}
+
+            # When an object uses additionalProperties with real type info (not just
+            # true/false) together with propertyNames, Gemini cannot represent this
+            # pattern.  Convert it into explicit ``properties`` so the model knows
+            # what keys and value types are expected.
+            additional: Any = obj_dict.get("additionalProperties")
+            property_names_enum: list[str] | None = None
+            pn = obj_dict.get("propertyNames")
+            if isinstance(pn, dict):
+                pn_dict = cast(dict[str, Any], pn)
+                property_names_enum = cast(list[str] | None, pn_dict.get("enum"))
+
+            if isinstance(additional, dict) and property_names_enum is not None and obj_dict.get("type") == "object":
+                # Build explicit properties from the enum keys + value schema
+                value_schema: dict[str, Any] = clean_schema(additional, parent_key="additionalProperties")
+                explicit_props: dict[str, Any] = {}
+                for prop_name in property_names_enum:
+                    explicit_props[prop_name] = dict(value_schema)
+                # Rebuild the object schema with explicit properties, all optional
+                cleaned: dict[str, Any] = {}
+                for key, value in obj_dict.items():
+                    if key in ["additionalProperties", "default", "propertyNames", "minProperties"]:
+                        continue
+                    cleaned[key] = clean_schema(value, parent_key=key)
+                # Merge with any pre-existing static properties rather than overwriting
+                existing_props = cast(dict[str, Any], cleaned.get("properties", {}))
+                merged = {**existing_props, **explicit_props}
+                cleaned["properties"] = merged if merged else {"_placeholder": {"type": "string"}}
+                return cleaned
+
+            cleaned = {}
             for key, value in obj_dict.items():
                 # Skip keys that Gemini doesn't support
                 # Note: 'title' is kept as Gemini handles it fine and it's useful for descriptions
-                if key in ["additionalProperties", "default"]:
+                if key in ["additionalProperties", "default", "propertyNames", "minProperties"]:
                     continue
 
                 cleaned_value = clean_schema(value, parent_key=key)
@@ -190,9 +220,46 @@ def fix_schema_for_openai(schema: dict[str, Any]) -> dict[str, Any]:
         "prefixItems",
     }
 
+    def _expand_property_names(obj_dict: dict[str, Any]) -> dict[str, Any] | None:
+        """When an object uses propertyNames + additionalProperties with real type
+        info, expand into explicit properties so downstream transforms can handle it."""
+        additional = obj_dict.get("additionalProperties")
+        pn = obj_dict.get("propertyNames")
+        property_names_enum: list[str] | None = None
+        if isinstance(pn, dict):
+            pn_dict = cast(dict[str, Any], pn)
+            property_names_enum = cast(list[str] | None, pn_dict.get("enum"))
+        if isinstance(additional, dict) and property_names_enum is not None and obj_dict.get("type") == "object":
+            value_schema: dict[str, Any] = additional
+            explicit_props: dict[str, Any] = {}
+            for prop_name in property_names_enum:
+                explicit_props[prop_name] = dict(value_schema)
+            # Rebuild without propertyNames/minProperties/additionalProperties
+            rebuilt: dict[str, Any] = {}
+            for k, v in obj_dict.items():
+                if k in ("additionalProperties", "propertyNames", "minProperties"):
+                    continue
+                rebuilt[k] = v
+            # Merge with any pre-existing static properties rather than overwriting
+            existing_props = cast(dict[str, Any], rebuilt.get("properties", {}))
+            rebuilt["properties"] = {**existing_props, **explicit_props}
+            return rebuilt
+        return None
+
     def clean_schema(obj: Any, *, is_properties_map: bool = False) -> Any:
         if isinstance(obj, dict):
             obj_dict = cast(dict[str, Any], obj)
+
+            # Expand propertyNames + additionalProperties pattern into explicit
+            # properties before applying the whitelist, otherwise the keys get
+            # stripped and the object ends up empty.
+            was_expanded = False
+            if not is_properties_map:
+                expanded = _expand_property_names(obj_dict)
+                if expanded is not None:
+                    obj_dict = expanded
+                    was_expanded = True
+
             cleaned: dict[str, Any] = {}
             for key, value in obj_dict.items():
                 # OpenAI strict mode doesn't support oneOf, convert to anyOf
@@ -229,6 +296,18 @@ def fix_schema_for_openai(schema: dict[str, Any]) -> dict[str, Any]:
                 # Ensure properties exists (OpenAI requires it for objects)
                 if "properties" not in cleaned:
                     cleaned["properties"] = {}
+                # For expanded propertyNames objects, make properties optional via
+                # nullable anyOf — OpenAI strict mode requires ALL properties in
+                # required, so we can't use required=[] with non-empty properties.
+                if was_expanded:
+                    props = cast(dict[str, Any], cleaned["properties"])
+                    for prop_key in list(props.keys()):
+                        original: dict[str, Any] = cast(dict[str, Any], props[prop_key])
+                        if "anyOf" in original:
+                            branches: list[Any] = list(original["anyOf"]) + [{"type": "null"}]
+                            props[prop_key] = {"anyOf": branches}
+                        else:
+                            props[prop_key] = {"anyOf": [original, {"type": "null"}]}
                 cleaned["required"] = list(cast(dict[str, Any], cleaned["properties"]).keys())
 
             return cleaned
