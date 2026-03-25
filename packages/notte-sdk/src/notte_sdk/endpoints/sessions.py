@@ -45,7 +45,6 @@ from notte_core.common.telemetry import track_usage
 from notte_core.data.space import ImageData, StructuredData, TBaseModel
 from notte_core.errors.base import NotteBaseError
 from notte_core.utils.files import create_or_append_cookies_to_file
-from notte_core.utils.webp_replay import MP4Replay
 from pydantic import BaseModel
 from typing_extensions import final, override
 
@@ -59,6 +58,7 @@ from notte_sdk.types import (
     ObserveRequestDict,
     ObserveResponse,
     PaginationParamsDict,
+    ReplayResponse,
     ScrapeMarkdownParamsDict,
     ScrapeRequestDict,
     SessionDebugResponse,
@@ -267,14 +267,14 @@ class SessionsClient(BaseClient):
         )
 
     @staticmethod
-    def _session_debug_replay_endpoint(session_id: str | None = None) -> NotteEndpoint[BaseModel]:
+    def _session_debug_replay_endpoint(session_id: str | None = None) -> NotteEndpoint[ReplayResponse]:
         """
         Returns an endpoint for retrieving the replay for a session.
         """
         path = SessionsClient.SESSION_DEBUG_REPLAY
         if session_id is not None:
             path = path.format(session_id=session_id)
-        return NotteEndpoint(path=path, response=BaseModel, method="GET")
+        return NotteEndpoint(path=path, response=ReplayResponse, method="GET")
 
     @staticmethod
     def _session_debug_offset_endpoint(session_id: str | None = None) -> NotteEndpoint[SessionOffsetResponse]:
@@ -470,19 +470,53 @@ class SessionsClient(BaseClient):
         return offset
 
     @track_usage("cloud.session.replay")
-    def replay(self, session_id: str) -> MP4Replay:
+    def replay(
+        self,
+        session_id: str,
+        wait: bool = True,
+        timeout: float = 240.0,
+        poll_interval: float = 5.0,
+    ) -> ReplayResponse:
         """
-        Downloads the replay for the specified session in mp4 format.
+        Get presigned URLs for session replay.
 
         Args:
-            session_id: The identifier of the session to download the replay for.
+            session_id: The identifier of the session to get the replay for.
+            wait: If True (default), poll until the replay is ready instead of
+                raising on 404.
+            timeout: Maximum seconds to wait for the replay to become available.
+            poll_interval: Seconds between polling attempts.
 
         Returns:
-            MP4Replay: The replay file in mp4 format.
+            ReplayResponse: Presigned URLs for HLS playlist and MP4 download.
+
+        Raises:
+            NotteAPIError: If the replay is not found and ``wait`` is False, or
+                if the timeout is exceeded.
+            TimeoutError: If the replay does not become available within ``timeout`` seconds.
         """
         endpoint = SessionsClient._session_debug_replay_endpoint(session_id=session_id)
-        file_bytes = self._request_file(endpoint, file_type="mp4")
-        return MP4Replay(file_bytes)
+        if not wait:
+            return self.request(endpoint)
+
+        logger.info(f"Waiting for replay of session {session_id} to be ready (timeout={timeout}s)...")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                response = self.request(endpoint)
+                logger.info(f"Replay for session {session_id} is ready")
+                return response
+            except NotteAPIError as e:
+                if e.status_code != 404:
+                    raise
+                error_msg = e.error.get("message", "") or e.error.get("detail", "")
+                if "still active" in error_msg:
+                    raise ValueError(
+                        f"Session {session_id} is still active — close the session first to generate the replay."
+                    ) from e
+                if time.monotonic() + poll_interval > deadline:
+                    raise TimeoutError(f"Replay for session {session_id} not ready within {timeout}s") from e
+                time.sleep(poll_interval)
 
     @track_usage("cloud.session.viewer.browser")
     def viewer_browser(self, session_id: str, _viewer_url: str | None = None) -> None:
@@ -846,27 +880,43 @@ class RemoteSession(SyncResource):
         """
         return self.client.offset(session_id=self.session_id).offset
 
-    def replay(self) -> MP4Replay:
+    def replay(
+        self,
+        wait: bool = True,
+        timeout: float = 240.0,
+        poll_interval: float = 5.0,
+    ) -> ReplayResponse:
         """
-        Get a replay of the session's execution in MP4 format.
+        Get presigned URLs for the session replay.
 
         **Example:**
         ```python
         replay = session.replay()
-        replay.save(f"{session.session_id}_replay.mp4")
+        print(replay.mp4_url)  # Presigned URL for MP4 download
+        replay.download("session.mp4")
         ```
 
-        > Note that the replay is only available after the session has been stopped.
+        By default this polls until the replay is ready. Set ``wait=False``
+        to fail immediately if the replay is not yet available.
 
-        Also you need to perform at least one action for the replay to be available.
+        Args:
+            wait: If True (default), poll until the replay is ready.
+            timeout: Maximum seconds to wait (default 120).
+            poll_interval: Seconds between polling attempts (default 2).
 
         Returns:
-            MP4Replay: The replay data in MP4 format.
+            ReplayResponse: Presigned URLs for HLS playlist and MP4 download.
 
         Raises:
             ValueError: If the session hasn't been started yet (no session_id available).
+            TimeoutError: If the replay does not become available within ``timeout`` seconds.
         """
-        return self.client.replay(session_id=self.session_id)
+        return self.client.replay(
+            session_id=self.session_id,
+            wait=wait,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
 
     def viewer_browser(self) -> None:
         """

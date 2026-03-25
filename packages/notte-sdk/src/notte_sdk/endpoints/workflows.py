@@ -13,7 +13,6 @@ from notte_core.common.logging import logger
 from notte_core.common.telemetry import track_usage
 from notte_core.errors.base import NotteBaseError
 from notte_core.utils.encryption import Encryption
-from notte_core.utils.webp_replay import MP4Replay
 from typing_extensions import deprecated
 
 from notte_sdk.endpoints.base import BaseClient, NotteEndpoint
@@ -38,6 +37,7 @@ from notte_sdk.types import (
     ListFunctionsRequest,
     ListFunctionsRequestDict,
     ListFunctionsResponse,
+    ReplayResponse,
     RunFunctionRequest,
     RunFunctionRequestDict,
     StartFunctionRunRequest,
@@ -643,16 +643,27 @@ class RemoteWorkflow:
     def workflow_id(self) -> str:
         return self.response.workflow_id
 
-    def replay(self) -> MP4Replay:
+    def replay(
+        self,
+        wait: bool = True,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0,
+    ) -> ReplayResponse:
         """
-        Replay the workflow run.
+        Get presigned URLs for the workflow run replay.
 
         ```python
         function = notte.Function("<your-function-id>")
         function.run()
         replay = function.replay()
-        replay.save("run_replay.webp")
+        print(replay.mp4_url)  # Presigned URL for MP4 download
+        replay.download("workflow.mp4")
         ```
+
+        Args:
+            wait: If True (default), poll until the replay is ready.
+            timeout: Maximum seconds to wait (default 120).
+            poll_interval: Seconds between polling attempts (default 2).
         """
         if self._function_run_id is None:
             raise ValueError(
@@ -662,7 +673,12 @@ class RemoteWorkflow:
             raise ValueError(
                 f"Session ID not found in your function run {self._function_run_id}. Please check that your workflow is creating at least one `client.Session` in the `run` function."
             )
-        return self.root_client.sessions.replay(session_id=self._session_id)
+        return self.root_client.sessions.replay(
+            session_id=self._session_id,
+            wait=wait,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
 
     def update(
         self,

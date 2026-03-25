@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import traceback
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Unpack, overload
@@ -14,7 +15,7 @@ from notte_core.agent_types import AgentCompletion
 from notte_core.common.logging import logger
 from notte_core.common.notifier import BaseNotifier
 from notte_core.common.telemetry import track_usage
-from notte_core.utils.webp_replay import MP4Replay, WebpReplay
+from notte_core.utils.webp_replay import WebpReplay
 from pydantic import BaseModel, Field, ValidationError
 from typing_extensions import final
 
@@ -36,6 +37,7 @@ from notte_sdk.types import (
     AgentStatusResponse,
     AgentWorkflowCodeRequest,
     GetFunctionResponse,
+    ReplayResponse,
     SdkAgentCreateRequest,
     SdkAgentStartRequestDict,
 )
@@ -86,8 +88,6 @@ class AgentsClient(BaseClient):
     AGENT_STATUS = "{agent_id}"
     AGENT_FUNCTION = "{agent_id}/workflow/code"
     AGENT_LIST = ""
-    # The following endpoints downloads a MP4 file
-    AGENT_REPLAY = "{agent_id}/replay"
     AGENT_LOGS_WS = "{agent_id}/debug/logs?token={token}&session_id={session_id}"
 
     def __init__(
@@ -186,16 +186,6 @@ class AgentsClient(BaseClient):
         if agent_id is not None:
             path = path.format(agent_id=agent_id)
         return NotteEndpoint(path=path, response=AgentFunctionCodeResponse, method="GET")
-
-    @staticmethod
-    def _agent_replay_endpoint(agent_id: str | None = None) -> NotteEndpoint[BaseModel]:
-        """
-        Creates an endpoint for downloading an agent's replay.
-        """
-        path = AgentsClient.AGENT_REPLAY
-        if agent_id is not None:
-            path = path.format(agent_id=agent_id)
-        return NotteEndpoint(path=path, response=BaseModel, method="GET")
 
     @staticmethod
     def _agent_list_endpoint(params: AgentListRequest | None = None) -> NotteEndpoint[AgentResponse]:
@@ -697,7 +687,7 @@ class AgentsClient(BaseClient):
         Raises:
             ValueError: If no valid agent ID can be determined.
         """
-        request = AgentStatusRequest(agent_id=agent_id, replay=False)
+        request = AgentStatusRequest(agent_id=agent_id)
         endpoint = AgentsClient._agent_status_endpoint(agent_id=agent_id).with_params(request)
         response = self.request(endpoint)
         return response
@@ -719,30 +709,6 @@ class AgentsClient(BaseClient):
         params = AgentListRequest.model_validate(data)
         endpoint = AgentsClient._agent_list_endpoint(params=params)
         return self.request_list(endpoint)
-
-    def replay(self, agent_id: str) -> MP4Replay:
-        """
-        Downloads the replay for the specified agent in mp4 format.
-
-        ```python
-        replay = agent.replay()
-        ```
-
-        The replay is a mp4 file that can be displayed in a browser.
-
-        ```python
-        replay.show()
-        ```
-
-        Args:
-            agent_id: The identifier of the agent to download the replay for.
-
-        Returns:
-            MP4Replay: The replay file in mp4 format.
-        """
-        endpoint = AgentsClient._agent_replay_endpoint(agent_id=agent_id)
-        file_bytes = self._request_file(endpoint, file_type="mp4")
-        return MP4Replay(file_bytes)
 
     def run_custom(self, request: BaseModel, viewer: bool = False) -> AgentStatusResponse:
         """
@@ -779,19 +745,17 @@ class RemoteAgent:
     """
     A remote agent that can execute tasks through the Notte API.
 
-    This class provides an interface for running tasks, checking status, and managing replays
-    of agent executions. It maintains state about the current agent execution and provides
+    This class provides an interface for running tasks, checking status, and managing
+    agent executions. It maintains state about the current agent execution and provides
     methods to interact with the agent through an AgentsClient.
 
     The agent can be started, monitored, and controlled through various methods. It supports
-    both synchronous and asynchronous execution modes, and can provide visual replays of
-    its actions in MP4 format.
+    both synchronous and asynchronous execution modes.
 
     Key Features:
     - Start and stop agent execution
     - Monitor agent status and progress
     - Wait for task completion with progress updates
-    - Get visual replays of agent actions
     - Support for both sync and async execution
 
     Attributes:
@@ -1154,6 +1118,39 @@ class RemoteAgent:
         """
         return self.client.status(agent_id=self.agent_id)
 
+    def replay(
+        self,
+        wait: bool = True,
+        timeout: float = 240.0,
+        poll_interval: float = 5.0,
+    ) -> ReplayResponse:
+        """
+        Get the replay for the agent's session.
+
+        .. deprecated::
+            Use ``session.replay()`` instead. Agent replay is deprecated
+            in favor of session-level replay with presigned URLs.
+
+        Args:
+            wait: If True (default), poll until the replay is ready.
+            timeout: Maximum seconds to wait (default 120).
+            poll_interval: Seconds between polling attempts (default 2).
+
+        Returns:
+            ReplayResponse: Presigned URLs for HLS playlist and MP4 download.
+        """
+        warnings.warn(
+            "agent.replay() is deprecated. Use session.replay() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.client.root_client.sessions.replay(
+            session_id=self.session_id,
+            wait=wait,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
     @property
     @track_usage("cloud.agent.workflow")
     def workflow(self) -> AgentWorkflow:
@@ -1172,24 +1169,3 @@ class RemoteAgent:
             ValueError: If the agent hasn't been run yet (no agent_id available).
         """
         return RemoteAgent.AgentWorkflow(self.client, self.agent_id)
-
-    @track_usage("cloud.agent.replay")
-    def replay(self) -> MP4Replay:
-        """
-        Get a replay of the agent's execution in MP4 format.
-
-        This method downloads a visual replay of the agent's actions, which can be
-        useful for debugging or understanding the agent's behavior.
-
-        ```python
-        replay = agent.replay()
-        replay.save(f"{agent.agent_id}_replay.mp4")
-        ```
-
-        Returns:
-            MP4Replay: The replay data in MP4 format.
-
-        Raises:
-            ValueError: If the agent hasn't been run yet (no agent_id available).
-        """
-        return self.client.replay(agent_id=self.agent_id)
