@@ -130,6 +130,7 @@
                 "group": "Integrations",
                 "icon": "plug",
                 "pages": [
+                  "integrations/claude-code-ai-agents",
                   {
                     "group": "MCP",
                     "collapsed": true,
