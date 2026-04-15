@@ -2861,6 +2861,7 @@ dev = [
     { name = "pytest-timeout" },
     { name = "pytest-xdist", extra = ["psutil"] },
     { name = "sphinx" },
+    { name = "sphinx-mintlify" },
     { name = "twine" },
 ]
 lint = [
@@ -2904,6 +2905,7 @@ dev = [
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", extras = ["psutil"], specifier = ">=3.8.0" },
     { name = "sphinx", specifier = ">=8.2.3" },
+    { name = "sphinx-mintlify", specifier = ">=0.1.0" },
     { name = "twine", specifier = ">=6.1.0" },
 ]
 lint = [{ name = "ruff", specifier = ">=0.9.7" }]
@@ -7798,6 +7800,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/38/ad/4360e50ed56cb483667b8e6dadf2d3fda62359593faabbe749a27c4eaca6/sphinx-8.2.3.tar.gz", hash = "sha256:398ad29dee7f63a75888314e9424d40f52ce5a6a87ae88e7071e80af296ec348", size = 8321876, upload-time = "2025-03-02T22:31:59.658Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/31/53/136e9eca6e0b9dc0e1962e2c908fbea2e5ac000c2a2fbd9a35797958c48b/sphinx-8.2.3-py3-none-any.whl", hash = "sha256:4405915165f13521d875a8c29c8970800a0141c14cc5416a38feca4ea5d9b9c3", size = 3589741, upload-time = "2025-03-02T22:31:56.836Z" },
+]
+
+[[package]]
+name = "sphinx-mintlify"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docutils" },
+    { name = "sphinx" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e8/a1/6eb6cfbd41e520f746c762bdc0373bf6b4853b4db4a2dd635c54daf32ae5/sphinx_mintlify-0.1.1.tar.gz", hash = "sha256:e04fd6bba69c198c2965992664f2808830070839afdfa539d885fbe73d1c20e0", size = 20295, upload-time = "2026-04-15T23:02:37.958Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9b/b4/30f62774e9f9bd2c63b97c5834173f612970a8a56389f605f3d6c15b85fb/sphinx_mintlify-0.1.1-py3-none-any.whl", hash = "sha256:618bc2ee32deb350169d6310d9b4dca6533de3dec438943368de4f9762a958cb", size = 21100, upload-time = "2026-04-15T23:02:36.781Z" },
 ]
 
 [[package]]
